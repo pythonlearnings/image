@@ -37,9 +37,12 @@ jobs:
     steps:
       - name: Resolve params
         id: vars
+        env:
+          DOWNLOAD_SOURCE: ${{ inputs.source }}
+          RELEASE_TAG: ${{ inputs.tag_name }}
         shell: pwsh
         run: |
-          $src = "${{ inputs.source }}".Trim()
+          $src = $env:DOWNLOAD_SOURCE.Trim()
           if ([string]::IsNullOrWhiteSpace($src)) { throw "source is empty" }
 
           $mode = if ($src -match '^\s*https?://') { 'url' } else { 'pip' }
@@ -62,8 +65,11 @@ jobs:
           if ([string]::IsNullOrWhiteSpace($pkg)) { $pkg = 'download' }
 
           $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
-          $tag = "${{ inputs.tag_name }}"
+          $tag = ([string]$env:RELEASE_TAG).Trim()
           if ([string]::IsNullOrWhiteSpace($tag)) { $tag = "$pkg-$stamp" }
+
+          git check-ref-format "refs/tags/$tag"
+          if ($LASTEXITCODE -ne 0) { throw 'Invalid Release tag' }
 
           Write-Host "Mode=$mode  Pkg=$pkg  Tag=$tag"
           "mode=$mode" | Add-Content $env:GITHUB_OUTPUT
@@ -77,26 +83,37 @@ jobs:
 
       - name: Download (pip)
         if: steps.vars.outputs.mode == 'pip'
+        env:
+          DOWNLOAD_SOURCE: ${{ inputs.source }}
         shell: pwsh
         run: |
           $PSNativeCommandArgumentPassing = 'Standard'
           # 注意：不要命名为 $args，那是 PowerShell 自动变量
-          $pipArgs = "${{ inputs.source }}".Trim() -replace '^\s*(python\s+-m\s+)?pip3?\s+download\s+', ''
+          $pipArgs = $env:DOWNLOAD_SOURCE.Trim() -replace '^\s*(python\s+-m\s+)?pip3?\s+download\s+', ''
 
-          # 强制剥掉用户自带的 -d/--dest，统一落到 ./download
-          if ($pipArgs -match '(^|\s)(-d|--dest)(\s|=)') {
-            Write-Host "::warning::忽略输入里的 -d/--dest，统一用 -d download"
-            $pipArgs = $pipArgs -replace '(^|\s)(-d|--dest)(\s+[^\s]+|=[^\s]+)', ' '
+          $pattern = @'
+          (?:[^\s"']+|"[^"]*"|'[^']*')+
+          '@
+          $covered = [regex]::Replace($pipArgs, $pattern.Trim(), '')
+          if ($covered.Trim()) { throw 'Unbalanced quotes in pip download arguments' }
+          $tokens = @([regex]::Matches($pipArgs, $pattern.Trim()) | ForEach-Object {
+            $_.Value -replace '"([^"]*)"|''([^'']*)''', '$1$2'
+          })
+          if (-not $tokens.Count) { throw 'No pip download arguments' }
+
+          $downloadArgs = @('-m', 'pip', 'download')
+          for ($i = 0; $i -lt $tokens.Count; $i++) {
+            if ($tokens[$i] -eq '-d' -or $tokens[$i] -eq '--dest') {
+              $i++
+            } elseif ($tokens[$i] -notmatch '^(--dest=|-d.+)') {
+              $downloadArgs += $tokens[$i]
+            }
           }
-          $pipArgs = $pipArgs.Trim()
-          if (-not $pipArgs) { throw "no pip args after stripping" }
-
           New-Item -ItemType Directory -Force download | Out-Null
-
-          # array splat：避免 IEX 对引号/$ 的二次解析
-          $argArr = @('-m', 'pip', 'download') + ($pipArgs -split '\s+' | Where-Object { $_ }) + @('-d', 'download')
-          Write-Host "Invoking: python $($argArr -join ' ')"
-          & python @argArr
+          $downloadArgs += @('-d', 'download')
+          & python @downloadArgs 2>&1 | ForEach-Object {
+            Write-Host ([regex]::Replace([string]$_, '(?i)https?://\S+', '[URL withheld]'))
+          }
           if ($LASTEXITCODE -ne 0) { throw "pip download failed (exit=$LASTEXITCODE)" }
 
           $found = @(Get-ChildItem 'download' -Recurse -File -ErrorAction SilentlyContinue)
@@ -106,10 +123,12 @@ jobs:
 
       - name: Download (url)
         if: steps.vars.outputs.mode == 'url'
+        env:
+          DOWNLOAD_SOURCE: ${{ inputs.source }}
         shell: pwsh
         run: |
           $PSNativeCommandArgumentPassing = 'Standard'
-          $url = "${{ inputs.source }}".Trim()
+          $url = $env:DOWNLOAD_SOURCE.Trim()
           New-Item -ItemType Directory -Force download | Out-Null
 
           $name = [System.IO.Path]::GetFileName(([System.Uri]$url).AbsolutePath)
@@ -117,7 +136,6 @@ jobs:
           $name = ($name -replace '[^a-zA-Z0-9_.+-]', '_')   # 防 URL 路径里的奇怪字符
           $dest = "download\$name"
 
-          Write-Host "GET $url -> $dest"
           # curl.exe 比 Invoke-WebRequest 在 GB 级文件上快 5-10x
           $curlArgs = @('-sSL', '--fail', '--retry', '3', '--retry-delay', '2',
                         '--connect-timeout', '30', '--max-time', '3600',
@@ -140,6 +158,9 @@ jobs:
           }
 
       - name: Compress + split
+        env:
+          VOLUME_SIZE_MB: ${{ inputs.volume_size_mb }}
+          ZIP_LEVEL: ${{ inputs.zip_level }}
         shell: pwsh
         run: |
           # Legacy mode 会把 -mx=0 这种带 = 的 arg 隐式 quote 让 7z 解析失败
@@ -149,12 +170,12 @@ jobs:
           $sz   = "C:\Program Files\7-Zip\7z.exe"
 
           $volMB = 0
-          if (-not [int]::TryParse("${{ inputs.volume_size_mb }}", [ref]$volMB) -or $volMB -le 0) {
-            throw "volume_size_mb 必须是正整数（收到 '${{ inputs.volume_size_mb }}'）"
+          if (-not [int]::TryParse($env:VOLUME_SIZE_MB, [ref]$volMB) -or $volMB -le 0) {
+            throw "volume_size_mb must be a positive integer"
           }
 
           $levelMap = @{ 'store' = 'mx0'; 'fast' = 'mx1'; 'normal' = 'mx5'; 'max' = 'mx9' }
-          $level = "${{ inputs.zip_level }}"
+          $level = $env:ZIP_LEVEL
           if (-not $levelMap.ContainsKey($level)) { throw "invalid zip_level: $level" }
           $mxArg = "-$($levelMap[$level])"
 
@@ -204,28 +225,10 @@ jobs:
           }
           Invoke-7z -Label 'outer' -Arguments @('a', '-t7z', '-mx0', '-y', $volArg, "$pkg.outer.7z", "$pkg.zip")
 
-          # ---- ASSERT：outer 必须有恰好 1 entry = $pkg.zip ----
-          Write-Host "---- 7z l $pkg.outer.7z.001 ----"
-          $listing = (& $sz l "$pkg.outer.7z.001" 2>&1) | Out-String
-          Write-Host $listing
-          $expectedEntry = "$pkg.zip"
-          if ($listing -notmatch [regex]::Escape($expectedEntry)) {
-            throw "outer does NOT contain '$expectedEntry'"
-          }
-          # 7z listing 里 summary 行("N files")也以日期开头但 Attr 列空白；
-          # 用 [A-Z.]{5}\s 精确锁定真 entry 行
-          $entryLines = @($listing -split "`r?`n" | Where-Object {
-            $_ -match '^\s*\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\s+[A-Z.]{5}\s+\d+\s+\d+\s+\S'
-          })
-          if ($entryLines.Count -ne 1) {
-            throw "expected 1 entry, got $($entryLines.Count):`n$($entryLines -join "`n")"
-          }
-          if ($entryLines[0] -notmatch [regex]::Escape($expectedEntry) + '\s*$') {
-            throw "entry doesn't end with '$expectedEntry': $($entryLines[0])"
-          }
+          $volumes = @(Get-ChildItem "$pkg.outer.7z.[0-9]*" -File)
+          if (-not $volumes.Count) { throw '7-Zip produced no volumes' }
 
-          # 防火墙只放行 .7z -> 分卷尾部追加 .7z；@(...) 物化避免边遍历边 rename 的坑
-          @(Get-ChildItem "$pkg.outer.7z.[0-9]*") | Where-Object { $_.Name -notlike '*.7z.7z' } | ForEach-Object {
+          $volumes | Where-Object { $_.Name -notlike '*.7z.7z' } | ForEach-Object {
             Rename-Item $_.FullName -NewName "$($_.Name).7z"
           }
           Remove-Item -Force "$pkg.zip"
@@ -238,10 +241,9 @@ jobs:
         with:
           tag_name: ${{ steps.vars.outputs.tag }}
           generate_release_notes: false
+          fail_on_unmatched_files: true
           body: |
-            ```
-            ${{ inputs.source }}
-            ```
+            Package: ${{ steps.vars.outputs.pkg }}
             zip level: `${{ inputs.zip_level }}`
           files: |
             ${{ steps.vars.outputs.pkg }}.outer.7z.*.7z
