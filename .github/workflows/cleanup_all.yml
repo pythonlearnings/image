@@ -1,4 +1,4 @@
-name: "Cleanup Releases, Tags and Actions runs"
+name: "🧹 Cleanup Releases, Tags and Actions runs"
 
 on:
   workflow_dispatch:
